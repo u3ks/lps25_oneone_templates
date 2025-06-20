@@ -1,0 +1,192 @@
+## ampli-stac-download.py
+# A script to download the Sentinel-3 AMPLI Products from a STAC API collection
+# This script uses the pystac-client library to interact with the STAC API and download assets in parallel.
+# ================
+# Requirements:
+# - Python 3.x
+# - pystac-client
+# - requests
+# - tqdm
+# - zipfile
+# - concurrent.futures
+# =================
+## Usage:
+# 1. Install the required libraries:
+#    ```bash
+#    pip install pystac-client requests tqdm
+#
+#     ```
+# 2. Set the 7 needed input parameters, between lines 37 and 78:
+#     output_dir / selection / area / mission / cycle_start / cycle_stop / handbook
+#
+# 3. Run the script:
+#    ```bash
+#    python ampli-stac-download.py
+#    ```    
+# 4. Follow the prompts to enter the maximum parallel downloads
+
+# -*- coding: utf-8 -*-
+
+import os
+import requests
+import zipfile
+from pystac_client import Client
+from tqdm import tqdm
+from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pdb import set_trace
+
+######################### INPUT PARAMETERS #############################
+
+# 1) Folder where the Sentinel-3 AMPLI Products will be downloaded
+# =================================================================
+output_dir      = "./output_dir"
+
+# 2) Selection: 
+#  => Either "full" for downloading the complete data set + User Handbook
+#  => Or "partial" for downloading a subset of the products, using the parameters below
+# ==========================================================================
+
+selection       = "full"    
+# ~ selection       = "partial"     
+
+# 3) Area  
+#   => Either "antarctica" or "greenland" or "both"
+# ==================================================
+
+# ~ area           = "antarctica"
+area           = "greenland"
+# ~ area           = "both"
+
+# 4) mission 
+#   => Either "sentinel-3a" or "sentinel-3b" 
+# ==================================================
+
+mission         = "sentinel-3a"
+# ~ mission         = "sentinel-3b"
+
+# 5 & 6) cycle_start & cycle_stop
+#  => range of orbit cycles, to be provided as integer (cycle_stop included)
+# ===========================================================================
+cycle_start     = 51
+cycle_stop      = 52
+
+# 7) User Handbook 
+#    => downloaded the User Handbook. Either "yes" or "no"
+# ==================================================
+handbook        = "yes"
+# ~ handbook        = "no"
+
+########################################################################
+
+
+def download_asset(url, dest_path):
+    response = requests.head(url)
+    response.raise_for_status()
+    file_size = int(response.headers.get('Content-Length', 0))
+    if file_size > 1 * 1024 * 1024 * 1024:  # 1GB in bytes
+        raise ValueError(f"File size {file_size / (1024 * 1024):.2f} MB exceeds 1GB limit.")
+    
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+def main():
+    
+    stac_url        = "https://eoresults.esa.int/stac"
+    collection_name = "sentinel3-ampli-ice-sheet-elevation"
+    
+    os.makedirs(output_dir, exist_ok=True)
+    download_base_url = stac_url.rsplit('/', 1)[0]
+
+    # Ask user for max parallel downloads
+    while True:
+        try:
+            max_parallel = int(input("Enter maximum number of parallel file downloads: max < 5 (e.g., 4): ").strip())
+            if max_parallel > 0 and max_parallel < 5:
+                break
+            else:
+                print("Please enter a positive integer less than 5.")
+        except ValueError:
+            print("Invalid input. Please enter a positive integer less than 5.")
+
+
+    print("Opening catalog...")
+
+    catalog     = Client.open(stac_url)
+    search      = catalog.search(collections=[collection_name])
+    items       = list(search.items())
+
+    print(f"Found {len(items)} items in collection '{collection_name}'.")
+    
+    print("Item selection...")
+    
+    # Data Download selection 
+    items_sel = []
+    if selection == "partial":
+        for it in range(0,len(items)):
+            
+            if "handbook" in items[it].id:
+                if handbook == "yes":items_sel.append(items[it])
+                continue
+            cycle_int = int(items[it].id[-3::])
+            if (cycle_int < cycle_start) | (cycle_int > cycle_stop):continue
+            if area != "both":
+                if area not in items[it].id:continue
+            if mission not in items[it].id:continue   
+
+            items_sel.append(items[it])
+            
+    elif selection == "full":
+        items_sel = items
+    else:
+        print("'selection' variable not properly set...exit")
+        exit()
+
+
+    if len(items_sel) == 0:
+        print("Error in item selection, no item found...exit")
+        exit()
+    else:
+        print(f"Starting download of {len(items_sel)} items...")
+        
+
+    for item in tqdm(items_sel, desc="Processing items"):
+        item_id         = item.id
+        assets          = item.assets
+        zip_filename    = os.path.join(output_dir, f"{item_id}_assets.zip")
+        download_tasks  = []
+        asset_files     = []
+
+        # Prepare download tasks with extension filter
+        for asset_key, asset in assets.items():
+            asset_url = urljoin(download_base_url, asset.href)
+            ext = os.path.splitext(asset_url)[-1]
+            # ~ if file_ext and ext.lower() != file_ext.lower():
+                # ~ continue
+            asset_filename = f"{item_id}_{asset_key}{ext}"
+            asset_path = os.path.join(output_dir, asset_filename)
+            download_tasks.append((asset_url, asset_path, asset_filename))
+            asset_files.append((asset_path, asset_filename))
+
+        # Download assets in parallel
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            future_to_asset = {
+                executor.submit(download_asset, url, path): (url, path)
+                for url, path, _ in download_tasks
+            }
+            for future in as_completed(future_to_asset):
+                url, path = future_to_asset[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Failed to download {url}: {e}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
